@@ -1,21 +1,33 @@
+import argparse
+import shutil
 from pathlib import Path
 
-from ultralytics import YOLO
+from ultralytics.utils.downloads import attempt_download_asset
 
 WEIGHTS_DIR = Path("weights")
-WEIGHTS_DIR.mkdir(exist_ok=True)
 
-MODEL_NAME = "yolov8n.pt"
-MODEL_PATH = WEIGHTS_DIR / MODEL_NAME
 
-if not MODEL_PATH.exists():
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Download pretrained YOLO weights into weights/.")
+    parser.add_argument("--model", type=str, default="yolov8n.pt", help="Ultralytics asset name, e.g. yolov8n.pt.")
+    args = parser.parse_args()
+
+    WEIGHTS_DIR.mkdir(exist_ok=True)
+    model_path = WEIGHTS_DIR / args.model
+    if model_path.exists():
+        print("Model already exists:", model_path)
+        return
+
     print("Downloading model...")
-    model = YOLO(MODEL_NAME)
-    downloaded_path = Path(model.ckpt_path) if getattr(model, "ckpt_path", None) else None
-    if downloaded_path and downloaded_path.exists():
-        MODEL_PATH.write_bytes(downloaded_path.read_bytes())
-    else:
-        model.save(str(MODEL_PATH))
-    print("Model saved to:", MODEL_PATH)
-else:
-    print("Model already exists:", MODEL_PATH)
+    # Downloads straight to weights/<name>, so no extra copy is left in the project root.
+    found = Path(attempt_download_asset(model_path))
+    if not model_path.exists() and found.is_file():
+        # Already present in Ultralytics' global weights_dir: copy it into the project.
+        shutil.copy2(found, model_path)
+    if not model_path.exists():
+        raise RuntimeError(f"Download failed: {model_path}")
+    print("Model saved to:", model_path)
+
+
+if __name__ == "__main__":
+    main()

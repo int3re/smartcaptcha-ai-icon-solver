@@ -21,6 +21,9 @@ class DatasetConfig:
     white_bg_threshold: int = 235
     min_object_size_px: int = 12
     edge_padding_px: int = 2
+    # Bicubic resize/rotate leaves near-transparent pixels around the object; the label
+    # box is taken at the 50% coverage level, i.e. the edge of the original binary mask.
+    bbox_alpha_threshold: int = 128
 
     rotation_range: Tuple[float, float] = (-90.0, 90.0)
     scale_range: Tuple[float, float] = (0.40, 0.90)
@@ -32,6 +35,8 @@ class DatasetConfig:
     anisotropic_stretch_prob: float = 0.72
     flip_horizontal_prob: float = 0.5
     flip_vertical_prob: float = 0.1
+    # Glyph-like icons whose mirror image does not occur in reality (letters, "S").
+    no_flip_classes: Tuple[str, ...] = ("a_word", "m_word", "t_word", "f_x", "circle_s")
     object_noise_prob: float = 0.2
     object_brightness_range: Tuple[float, float] = (0.9, 1.15)
     object_contrast_range: Tuple[float, float] = (0.9, 1.15)

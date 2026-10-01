@@ -67,10 +67,11 @@ def save_classes_json(class_map: Dict[str, int], output_dir: Path) -> None:
         json.dump(class_map, f, ensure_ascii=False, indent=2)
 
 
-def save_data_yaml(class_map: Dict[str, int], output_dir: Path, dataset_root_name: str) -> None:
+def save_data_yaml(class_map: Dict[str, int], output_dir: Path) -> None:
     inverse_names = {class_id: class_name for class_name, class_id in class_map.items()}
+    # No "path" key: Ultralytics then resolves train/val relative to the yaml file itself,
+    # so the dataset works regardless of the current directory and survives being moved.
     payload = {
-        "path": dataset_root_name,
         "train": "train/images",
         "val": "val/images",
         "nc": len(class_map),

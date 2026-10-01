@@ -17,20 +17,42 @@ def build_report(
     iou_thres: float,
     device: str,
 ) -> dict[str, Any]:
-    unique_classes = sorted({d["class_name"] for d in detections})
-    avg_conf = round(sum(d["confidence"] for d in detections) / len(detections), 4) if detections else 0.0
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "model_path": str(model_path),
         "device": device,
         "thresholds": {"confidence": conf_thres, "iou": iou_thres},
         "image": image_info,
-        "summary": {
-            "total_objects": len(detections),
-            "unique_classes": unique_classes,
-            "avg_confidence": avg_conf,
-            "inference_ms": round(inference_ms, 2),
-        },
+        "summary": _summarize(detections, inference_ms),
+        "detections": detections,
+    }
+
+
+def _summarize(detections: list[dict[str, Any]], inference_ms: float) -> dict[str, Any]:
+    unique_classes = sorted({d["class_name"] for d in detections})
+    avg_conf = round(sum(d["confidence"] for d in detections) / len(detections), 4) if detections else 0.0
+    return {
+        "total_objects": len(detections),
+        "unique_classes": unique_classes,
+        "avg_confidence": avg_conf,
+        "inference_ms": round(inference_ms, 2),
+    }
+
+
+def filter_report(report: dict[str, Any], conf_threshold: float) -> dict[str, Any]:
+    """Copy of the report keeping only detections at or above conf_threshold.
+
+    Inference runs with a low threshold so the UI slider can go down to it; exports must
+    reflect what the user sees, so the threshold the model ran with is kept separately.
+    """
+    detections = [d for d in report["detections"] if float(d["confidence"]) >= conf_threshold]
+    thresholds = dict(report["thresholds"])
+    thresholds["inference_confidence"] = thresholds.get("inference_confidence", thresholds["confidence"])
+    thresholds["confidence"] = conf_threshold
+    return {
+        **report,
+        "thresholds": thresholds,
+        "summary": _summarize(detections, report["summary"]["inference_ms"]),
         "detections": detections,
     }
 

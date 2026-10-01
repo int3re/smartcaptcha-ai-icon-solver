@@ -222,16 +222,6 @@ def colorize_mask_with_gradient(mask: Image.Image, gradient: GradientSpec) -> Im
     return Image.fromarray(rgba, mode="RGBA")
 
 
-def colorize_mask_with_solid(mask: Image.Image, rgb_color: Tuple[int, int, int]) -> Image.Image:
-    alpha = np.array(mask, dtype=np.uint8)
-    color = np.zeros((mask.height, mask.width, 3), dtype=np.uint8)
-    color[:, :, 0] = rgb_color[0]
-    color[:, :, 1] = rgb_color[1]
-    color[:, :, 2] = rgb_color[2]
-    rgba = np.dstack([color, alpha]).astype(np.uint8)
-    return Image.fromarray(rgba, mode="RGBA")
-
-
 def colorize_mask_with_duotone(mask: Image.Image, c1: Tuple[int, int, int], c2: Tuple[int, int, int], angle: float) -> Image.Image:
     alpha = np.array(mask, dtype=np.uint8)
     grad_rgb = _make_hard_split_gradient(mask.width, mask.height, c1, c2, angle=angle, alpha_mask=alpha)
@@ -275,10 +265,15 @@ def apply_object_transforms(
     rng: random.Random,
     np_rng: np.random.Generator,
     apply_appearance: bool = True,
+    allow_flip: bool = True,
 ) -> Image.Image:
-    if rng.random() < cfg.flip_horizontal_prob:
+    # Draw both flip decisions even when flipping is disabled, so the random stream
+    # (and therefore every other object in the dataset) does not depend on allow_flip.
+    flip_h = rng.random() < cfg.flip_horizontal_prob
+    flip_v = rng.random() < cfg.flip_vertical_prob
+    if allow_flip and flip_h:
         img_rgba = ImageOps.mirror(img_rgba)
-    if rng.random() < cfg.flip_vertical_prob:
+    if allow_flip and flip_v:
         img_rgba = ImageOps.flip(img_rgba)
 
     scale = _sample_biased_scale(cfg, rng)
@@ -335,9 +330,10 @@ def crop_to_alpha(img_rgba: Image.Image) -> Optional[Image.Image]:
     return img_rgba.crop((x_min, y_min, x_max, y_max))
 
 
-def get_tight_bbox_from_alpha(img_rgba: Image.Image) -> Optional[Tuple[int, int, int, int]]:
+def get_tight_bbox_from_alpha(img_rgba: Image.Image, threshold: int = 1) -> Optional[Tuple[int, int, int, int]]:
+    """Inclusive (x_min, y_min, x_max, y_max) of pixels with alpha >= threshold."""
     alpha = np.array(img_rgba.split()[3])
-    ys, xs = np.where(alpha > 0)
+    ys, xs = np.where(alpha >= max(1, threshold))
     if len(xs) == 0 or len(ys) == 0:
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())

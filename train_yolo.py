@@ -10,7 +10,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="output/data.yaml")
     parser.add_argument("--weights", type=str, default="weights/yolov8n.pt")
@@ -22,11 +22,34 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--project", type=str, default="runs/train")
     parser.add_argument("--name", type=str, default="exp")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Mixed precision (default: on). Ignored with --resume-from: Ultralytics restores it from the checkpoint.",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="auto",
+        help="SGD, AdamW, ... With 'auto' Ultralytics picks optimizer and lr0 itself and ignores --lr0.",
+    )
+    parser.add_argument("--lr0", type=float, default=None, help="Initial learning rate (requires explicit --optimizer).")
+    parser.add_argument("--warmup-epochs", type=float, default=None, help="Warmup epochs (Ultralytics default: 3). Use 0 for fine-tuning.")
+    parser.add_argument(
+        "--fliplr",
+        type=float,
+        default=0.0,
+        help="Horizontal flip probability of the whole mosaic. Default 0: the generator already flips "
+        "objects per class and must keep letter-like classes (DatasetConfig.no_flip_classes) unmirrored.",
+    )
     parser.add_argument("--sync-workers", type=int, default=8, help="Workers for label sync.")
     parser.add_argument("--copy-labels", action=argparse.BooleanOptionalAction, default=False, help="Force copying labels instead of hardlinking when possible.")
     parser.add_argument("--skip-label-sync", action=argparse.BooleanOptionalAction, default=False, help="Skip labels_yolo -> labels synchronization.")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.lr0 is not None and args.optimizer.lower() == "auto":
+        parser.error("--lr0 is ignored by Ultralytics with --optimizer auto; pass e.g. --optimizer SGD or AdamW.")
+    return args
 
 
 def main():
@@ -65,29 +88,25 @@ def main():
 
     print("=== TRAIN CONFIG ===")
     print("data:", args.data)
-    print("weights:", args.weights)
-    print("epochs:", args.epochs)
-    print("imgsz:", args.imgsz)
-    print("batch:", args.batch)
     print("device:", args.device)
-    print("project:", args.project)
-    print("name:", args.name)
-    if args.resume_from:
-        print("resume_from:", args.resume_from)
-        print("amp:", args.amp)
+    print("batch:", args.batch)
+    print("workers:", args.workers)
 
     if args.resume_from:
+        # Ultralytics restores every hyperparameter from the checkpoint and only lets a few
+        # memory/device related ones (batch, device, workers, ...) be overridden on resume.
+        print("resume_from:", args.resume_from)
+        if args.amp is not None:
+            print("WARNING: --amp/--no-amp is ignored on resume; AMP setting is taken from the checkpoint.")
         model = YOLO(args.resume_from)
         results = model.train(
             resume=True,
             device=args.device,
             workers=args.workers,
             batch=args.batch,
-            amp=args.amp,
         )
     else:
-        model = YOLO(args.weights)
-        results = model.train(
+        train_kwargs = dict(
             data=args.data,
             epochs=args.epochs,
             imgsz=args.imgsz,
@@ -96,8 +115,20 @@ def main():
             workers=args.workers,
             project=args.project,
             name=args.name,
-            amp=args.amp,
+            amp=True if args.amp is None else args.amp,
+            optimizer=args.optimizer,
+            fliplr=args.fliplr,
         )
+        if args.lr0 is not None:
+            train_kwargs["lr0"] = args.lr0
+        if args.warmup_epochs is not None:
+            train_kwargs["warmup_epochs"] = args.warmup_epochs
+        for key in ("weights", "epochs", "imgsz", "project", "name"):
+            print(f"{key}:", getattr(args, key))
+        for key in ("amp", "optimizer", "lr0", "warmup_epochs", "fliplr"):
+            print(f"{key}:", train_kwargs.get(key, "(ultralytics default)"))
+        model = YOLO(args.weights)
+        results = model.train(**train_kwargs)
 
     print("\nTraining finished")
     print("Results saved to:", results.save_dir)
@@ -113,25 +144,36 @@ def _link_or_copy(src: Path, dst: Path, force_copy: bool) -> None:
         shutil.copy2(src, dst)
 
 
+def resolve_dataset_root(data_path: Path, config: dict) -> Path:
+    """Dataset root the same way Ultralytics sees it (for datasets kept inside the project)."""
+    raw = config.get("path")
+    if not raw:
+        # Without "path" Ultralytics resolves splits relative to the yaml file.
+        return data_path.parent.resolve()
+    base_path = Path(raw)
+    if base_path.is_absolute():
+        return base_path
+    cwd_candidate = (Path.cwd() / base_path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (data_path.parent / base_path).resolve()
+
+
 def sync_ultralytics_labels(data_yaml_path: str, workers: int = 8, force_copy: bool = False) -> None:
     data_path = Path(data_yaml_path)
     config = yaml.safe_load(data_path.read_text(encoding="utf-8"))
+    base_path = resolve_dataset_root(data_path, config)
 
-    base_path = Path(config.get("path", "."))
-    if not base_path.is_absolute():
-        cwd_candidate = (Path.cwd() / base_path).resolve()
-        yaml_candidate = (data_path.parent / base_path).resolve()
-        if cwd_candidate.exists():
-            base_path = cwd_candidate
-        else:
-            base_path = yaml_candidate
-
-    for split_key in ("train", "val"):
+    synced_dirs: set[Path] = set()
+    for split_key in ("train", "val", "test"):
         split_images_rel = config.get(split_key)
         if not split_images_rel:
             continue
         split_images_dir = (base_path / split_images_rel).resolve()
         split_root = split_images_dir.parent
+        if split_root in synced_dirs:
+            continue
+        synced_dirs.add(split_root)
         yolo_labels_dir = split_root / "labels_yolo"
         labels_dir = split_root / "labels"
         if not yolo_labels_dir.exists():

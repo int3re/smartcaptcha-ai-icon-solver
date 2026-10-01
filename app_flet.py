@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import platform
-import subprocess
 import asyncio
 import time
 import logging
@@ -17,9 +14,13 @@ try:
 except Exception:
     fch = None
 
-from gui.image_utils import draw_detections, get_image_info, validate_image_path
+from gui import chart_events as ce
+from gui.image_utils import draw_detections, get_image_info, render_detections_png, validate_image_path
 from gui.model_utils import auto_detect_model, load_yolo_model, run_inference
-from gui.report_utils import build_report, save_report_csv, save_report_json
+from gui.report_utils import build_report, filter_report, save_report_csv, save_report_json
+from gui.state_store import load_state, update_state
+from gui.system_info import cpu_name
+from gui.theme import PALETTES
 
 LOGGER = logging.getLogger("yolo_gui_dashboard")
 if not LOGGER.handlers:
@@ -29,38 +30,10 @@ if not LOGGER.handlers:
     )
 
 
-PALETTES: dict[str, dict[str, str]] = {
-    "dark": {
-        "bg": "#0B1020",
-        "panel": "#131A2E",
-        "card": "#18223A",
-        "accent": "#4DA3FF",
-        "success": "#3DDC97",
-        "warning": "#FFB020",
-        "error": "#FF5D73",
-        "text_primary": "#E8EEF9",
-        "text_secondary": "#9FB0D0",
-        "border": "#263657",
-    },
-    "light": {
-        "bg": "#F5F7FC",
-        "panel": "#EEF2FA",
-        "card": "#FFFFFF",
-        "accent": "#2563EB",
-        "success": "#0F9D58",
-        "warning": "#D97706",
-        "error": "#DC2626",
-        "text_primary": "#0F172A",
-        "text_secondary": "#475569",
-        "border": "#D7DFEF",
-    },
-}
-
-
 def main(page: ft.Page) -> None:
     page.title = "YOLO Inference Dashboard"
-    page.window_min_width = 1280
-    page.window_min_height = 820
+    page.window.min_width = 1280
+    page.window.min_height = 820
     page.padding = 18
     page.scroll = ft.ScrollMode.AUTO
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
@@ -69,29 +42,23 @@ def main(page: ft.Page) -> None:
     artifacts_dir = project_root / "gui_outputs"
     artifacts_dir.mkdir(exist_ok=True)
     state_path = artifacts_dir / "gui_state.json"
+    saved_state = load_state(state_path)
 
-    def load_saved_theme() -> str:
-        try:
-            if state_path.exists():
-                data = json.loads(state_path.read_text(encoding="utf-8"))
-                mode = data.get("theme", "dark")
-                return mode if mode in PALETTES else "dark"
-        except Exception:
-            pass
-        return "dark"
-
-    def save_theme(mode: str) -> None:
-        try:
-            state_path.write_text(json.dumps({"theme": mode}, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    theme_mode = load_saved_theme()
+    theme_mode = saved_state.get("theme", "dark")
+    if theme_mode not in PALETTES:
+        theme_mode = "dark"
     palette = PALETTES[theme_mode].copy()
+
+    # The slider can go down to the threshold inference runs with; anything below it
+    # would have been discarded by the model already.
+    conf_slider_min = 0.05
+    conf_slider_max = 0.95
+    inference_conf = conf_slider_min
+    default_iou = 0.45
 
     state: dict[str, Any] = {
         "theme": theme_mode,
-        "model_path": auto_detect_model(project_root),
+        "model_path": auto_detect_model(project_root, preferred=saved_state.get("model_path")),
         "model": None,
         "images": [],
         "active_index": -1,
@@ -106,14 +73,15 @@ def main(page: ft.Page) -> None:
         "scatter_range": {"min_x": 0.0, "max_x": 1.0, "min_y": 0.0, "max_y": 1.0},
         "scatter_host_size": {"w": 0.0, "h": 0.0},
     }
-    default_conf = 0.25
-    default_iou = 0.45
     zoom_state: dict[str, float] = {"source": 1.0, "result": 1.0}
     zoom_min = 0.5
     zoom_max = 4.0
     zoom_step = 0.15
     max_content_width = 1720
     input_text_size = 13
+
+    # Native file dialogs; the service registers itself with the page on creation.
+    file_picker = ft.FilePicker()
 
     def color(key: str) -> str:
         return palette[key]
@@ -139,32 +107,11 @@ def main(page: ft.Page) -> None:
         else:
             LOGGER.info(message)
 
-    def human_cpu_name() -> str:
-        if os.name == "nt":
-            try:
-                cmd = [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
-                ]
-                value = subprocess.check_output(cmd, text=True, timeout=4).strip()
-                if value:
-                    return " ".join(value.split())
-            except Exception:
-                pass
-            env_name = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
-            if env_name:
-                return env_name
-        fallback = platform.processor().strip()
-        return fallback or "Unknown CPU"
-
-    device_label = f"CPU ({human_cpu_name()})"
+    device_label = f"CPU ({cpu_name()})"
 
     def toast(message: str, kind: str = "accent") -> None:
         bg = color(kind if kind in ("accent", "success", "warning", "error") else "accent")
-        page.snack_bar = ft.SnackBar(ft.Text(message, color=color("text_primary")), bgcolor=bg, open=True)
-        page.update()
+        page.show_dialog(ft.SnackBar(ft.Text(message, color=color("text_primary")), bgcolor=bg))
 
     def _apply_detection_card_visual(ui_state: str) -> None:
         if ui_state == "running":
@@ -208,61 +155,33 @@ def main(page: ft.Page) -> None:
 
         if ui_state == "running":
             processing_chip.bgcolor = color("accent")
-            processing_chip_icon.name = ft.Icons.AUTO_MODE
+            processing_chip_icon.icon = ft.Icons.AUTO_MODE
             processing_chip_text.value = status_text or "Analyzing image..."
             processing_strip_label.value = status_text or "Analyzing image..."
             processing_strip.value = None
-            analyze_btn.text = "Analyzing..."
+            analyze_btn.content = "Analyzing..."
             analyze_btn.icon = ft.Icons.HOURGLASS_TOP
             sum_card.opacity = 0.92
             charts_card.opacity = 0.92
-        elif ui_state == "success":
-            processing_chip.bgcolor = color("success")
-            processing_chip_icon.name = ft.Icons.CHECK_CIRCLE
-            processing_chip_text.value = status_text or "Detection completed"
-            processing_strip_label.value = status_text or "Detection completed"
-            processing_strip.value = 0.0
-            analyze_btn.text = "Analyze active image"
-            analyze_btn.icon = ft.Icons.PLAY_ARROW
-            sum_card.opacity = 1.0
-            charts_card.opacity = 1.0
-        elif ui_state == "empty":
-            processing_chip.bgcolor = color("warning")
-            processing_chip_icon.name = ft.Icons.INFO
-            processing_chip_text.value = status_text or "No objects detected"
-            processing_strip_label.value = status_text or "No objects detected"
-            processing_strip.value = 0.0
-            analyze_btn.text = "Analyze active image"
-            analyze_btn.icon = ft.Icons.PLAY_ARROW
-            sum_card.opacity = 1.0
-            charts_card.opacity = 1.0
-        elif ui_state == "error":
-            processing_chip.bgcolor = color("error")
-            processing_chip_icon.name = ft.Icons.ERROR_OUTLINE
-            processing_chip_text.value = status_text or "Inference error"
-            processing_strip_label.value = status_text or "Inference error"
-            processing_strip.value = 0.0
-            analyze_btn.text = "Analyze active image"
-            analyze_btn.icon = ft.Icons.PLAY_ARROW
-            sum_card.opacity = 1.0
-            charts_card.opacity = 1.0
         else:
-            processing_chip.bgcolor = color("success")
-            processing_chip_icon.name = ft.Icons.CHECK_CIRCLE
-            processing_chip_text.value = status_text or "Ready"
-            processing_strip_label.value = status_text or "Ready"
+            chip_colors = {"success": "success", "empty": "warning", "error": "error"}
+            chip_icons = {"empty": ft.Icons.INFO, "error": ft.Icons.ERROR_OUTLINE}
+            default_texts = {"success": "Detection completed", "empty": "No objects detected", "error": "Inference error"}
+            text = status_text or default_texts.get(ui_state, "Ready")
+            processing_chip.bgcolor = color(chip_colors.get(ui_state, "success"))
+            processing_chip_icon.icon = chip_icons.get(ui_state, ft.Icons.CHECK_CIRCLE)
+            processing_chip_text.value = text
+            processing_strip_label.value = text
             processing_strip.value = 0.0
-            analyze_btn.text = "Analyze active image"
+            analyze_btn.content = "Analyze active image"
             analyze_btn.icon = ft.Icons.PLAY_ARROW
             sum_card.opacity = 1.0
             charts_card.opacity = 1.0
 
         _apply_detection_card_visual(ui_state)
+        state["highlight_token"] = int(state.get("highlight_token", 0)) + 1
         if ui_state == "success":
-            state["highlight_token"] = int(state.get("highlight_token", 0)) + 1
             page.run_task(_clear_success_highlight_later, state["highlight_token"], 1.6)
-        else:
-            state["highlight_token"] = int(state.get("highlight_token", 0)) + 1
 
     def make_card(content: ft.Control, *, padding: int = 16, expand: bool = False, height: int | None = None) -> ft.Container:
         return ft.Container(
@@ -306,12 +225,7 @@ def main(page: ft.Page) -> None:
         set_analytics_visibility(False)
         apply_zoom("result", value=1.0, refresh=False)
 
-    def update_summary(report: dict[str, Any] | None, detections_for_view: list[dict[str, Any]] | None = None) -> None:
-        summary_list.controls = []
-        if not report:
-            summary_list.controls = [ft.Text("No inference yet.", color=color("text_secondary"))]
-            return
-
+    def update_summary(report: dict[str, Any], detections: list[dict[str, Any]]) -> None:
         def kv(label: str, value: str) -> ft.Row:
             return ft.Row(
                 [
@@ -321,33 +235,21 @@ def main(page: ft.Page) -> None:
                 vertical_alignment=ft.CrossAxisAlignment.START,
             )
 
-        if detections_for_view is None:
-            s = report["summary"]
-            unique_classes = s["unique_classes"]
-            total_objects = s["total_objects"]
-            avg_conf = s["avg_confidence"]
-        else:
-            total_objects = len(detections_for_view)
-            unique_classes = sorted({d["class_name"] for d in detections_for_view})
-            avg_conf = (
-                sum(float(d["confidence"]) for d in detections_for_view) / total_objects
-                if total_objects > 0
-                else 0.0
-            )
+        total_objects = len(detections)
+        unique_classes = sorted({d["class_name"] for d in detections})
+        avg_conf = sum(float(d["confidence"]) for d in detections) / total_objects if total_objects else 0.0
         img = report["image"]
-        summary_list.controls.extend(
-            [
-                kv("File:", img["filename"]),
-                kv("Image size:", f"{img['width']}x{img['height']}"),
-                kv("Objects:", str(total_objects)),
-                kv("Unique classes:", ", ".join(unique_classes) if unique_classes else "-"),
-                kv("Avg confidence:", f"{avg_conf:.4f}"),
-                kv("Inference time:", f"{report['summary']['inference_ms']} ms"),
-                kv("Conf threshold:", f"{state['conf_filter']:.2f}"),
-                kv("Device:", report.get("device", device_label)),
-                kv("Model:", report["model_path"]),
-            ]
-        )
+        summary_list.controls = [
+            kv("File:", img["filename"]),
+            kv("Image size:", f"{img['width']}x{img['height']}"),
+            kv("Objects:", str(total_objects)),
+            kv("Unique classes:", ", ".join(unique_classes) if unique_classes else "-"),
+            kv("Avg confidence:", f"{avg_conf:.4f}"),
+            kv("Inference time:", f"{report['summary']['inference_ms']} ms"),
+            kv("Conf threshold:", f"{state['conf_filter']:.2f}"),
+            kv("Device:", report.get("device", device_label)),
+            kv("Model:", report["model_path"]),
+        ]
 
     def detections_for_view(item: dict[str, Any] | None) -> list[dict[str, Any]]:
         if not item:
@@ -518,144 +420,15 @@ def main(page: ft.Page) -> None:
         charts_empty.visible = not has_data
         charts_card.height = 1220 if has_data else 220
 
-    def _to_int(value: Any) -> int:
-        if isinstance(value, bool):
-            return -1
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        if isinstance(value, str):
-            try:
-                return int(value.strip())
-            except Exception:
-                return -1
-        return -1
-
-    def _event_payload_dict(e: Any, max_len: int = 2048) -> dict[str, Any] | None:
-        data_raw = getattr(e, "data", None)
-        if not isinstance(data_raw, str) or not data_raw:
-            return None
-        if len(data_raw) > max_len:
-            return None
-        if not (data_raw.startswith("{") and data_raw.endswith("}")):
-            return None
-        try:
-            payload = json.loads(data_raw)
-            return payload if isinstance(payload, dict) else None
-        except Exception:
-            return None
-
-    def _event_index(e: Any, *keys: str, allow_payload: bool = True) -> int:
-        for key in keys:
-            value = _to_int(getattr(e, key, None))
-            if value >= 0:
-                return value
-
-        if not allow_payload:
-            return -1
-
-        payload = _event_payload_dict(e)
-        if isinstance(payload, dict):
-            candidate_keys = tuple(keys) + (
-                "spot_index",
-                "group_index",
-                "bar_group_index",
-                "point_index",
-                "selected_index",
-                "index",
-            )
-            for key in candidate_keys:
-                value = _to_int(payload.get(key))
-                if value >= 0:
-                    return value
-            for nested in payload.values():
-                if isinstance(nested, dict):
-                    for key in candidate_keys:
-                        value = _to_int(nested.get(key))
-                        if value >= 0:
-                            return value
-        return -1
-
-    def _event_coords(e: Any) -> tuple[float | None, float | None]:
-        # Try direct attributes first.
-        for xk, yk in (("x", "y"), ("local_x", "local_y"), ("dx", "dy"), ("chart_x", "chart_y")):
-            x = getattr(e, xk, None)
-            y = getattr(e, yk, None)
-            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                return float(x), float(y)
-
-        # Then try JSON payload from e.data.
-        data_raw = getattr(e, "data", None)
-        if isinstance(data_raw, str) and data_raw:
-            try:
-                payload = json.loads(data_raw)
-                for xk, yk in (("x", "y"), ("local_x", "local_y"), ("dx", "dy"), ("chart_x", "chart_y")):
-                    x = payload.get(xk)
-                    y = payload.get(yk)
-                    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                        return float(x), float(y)
-            except Exception:
-                pass
-        return None, None
-
-    def _event_type(e: Any) -> str:
-        for key in ("event_type", "type", "name"):
-            value = getattr(e, key, None)
-            if value is None:
-                continue
-            text = str(value).strip().lower()
-            if text:
-                return text
-        payload = _event_payload_dict(e)
-        if isinstance(payload, dict):
-            for key in ("event_type", "type", "name"):
-                value = payload.get(key)
-                if value is not None:
-                    text = str(value).strip().lower()
-                    if text:
-                        return text
-        return ""
-
-    def _is_chart_interaction_event(e: Any) -> bool:
-        et = _event_type(e)
-        if not et:
-            return True
-        allowed_tokens = ("hover", "tap", "click", "pointer")
-        return any(token in et for token in allowed_tokens)
-
-    def _is_click_like_event(e: Any) -> bool:
-        raw = getattr(e, "event_type", None)
-        if raw is None:
-            raw = getattr(e, "type", None)
-        if raw is None:
-            raw = getattr(e, "name", None)
-        et = str(raw).strip().lower() if raw is not None else ""
-        if not et:
-            return False
-        if "hover" in et or "move" in et:
-            return False
-        return any(token in et for token in ("click", "tap", "up", "selected", "select"))
-
-    def _event_short_dump(e: Any) -> str:
-        et = _event_type(e) or "unknown"
-        idx = _event_index(e, "spot_index", "group_index", "bar_group_index", "index", allow_payload=False)
-        data_raw = getattr(e, "data", None)
-        data_hint = "-"
-        if isinstance(data_raw, str):
-            data_hint = f"len={len(data_raw)}"
-        return f"type={et}, idx={idx}, data={data_hint}"
-
-    def _attach_chart_handler(chart: Any, handler: Any) -> None:
-        # Compatibility across flet_charts versions.
-        try:
-            chart.on_event = handler
-        except Exception:
-            pass
-        try:
-            chart.on_chart_event = handler
-        except Exception:
-            pass
+    def refresh_result_views(item: dict[str, Any]) -> None:
+        """Re-render everything that depends on the detections and the confidence slider."""
+        detections = detections_for_view(item)
+        result_image.src = render_detections_png(item["path"], detections)
+        result_image.visible = True
+        update_summary(item["report"], detections)
+        update_table(detections)
+        update_log(detections)
+        update_chart_view(detections)
 
     def set_chart_hover_info(text: str, min_interval_sec: float = 0.12) -> None:
         if not text:
@@ -678,31 +451,22 @@ def main(page: ft.Page) -> None:
             pass
 
     def _should_process_hover_index(chart_key: str, idx: int) -> bool:
-        try:
-            last_map = state.get("hover_last_index", {})
-            if not isinstance(last_map, dict):
-                return True
-            prev = int(last_map.get(chart_key, -1))
-            if prev == idx:
-                return False
-            last_map[chart_key] = idx
+        last_map = state.get("hover_last_index")
+        if not isinstance(last_map, dict):
             return True
-        except Exception:
-            return True
+        if int(last_map.get(chart_key, -1)) == idx:
+            return False
+        last_map[chart_key] = idx
+        return True
 
     def on_conf_chart_event(e: Any) -> None:
         try:
-            if not _is_chart_interaction_event(e):
+            if not ce.is_chart_interaction_event(e):
                 return
-            item = current_item()
-            detections = detections_for_view(item)
-            idx = _event_index(e, "group_index", "bar_group_index", "index")
-            log_msg(
-                f"[conf_chart] event: {_event_short_dump(e)}",
-                throttle_key="event_conf",
-                min_interval_sec=0.4,
-            )
-            if isinstance(idx, int) and 0 <= idx < len(detections):
+            detections = detections_for_view(current_item())
+            idx = ce.event_index(e, "group_index", "bar_group_index", "index")
+            log_msg(f"[conf_chart] event: {ce.event_short_dump(e)}", throttle_key="event_conf", min_interval_sec=0.4)
+            if 0 <= idx < len(detections):
                 if not _should_process_hover_index("conf", idx):
                     return
                 d = detections[idx]
@@ -712,73 +476,25 @@ def main(page: ft.Page) -> None:
                 )
         except Exception:
             LOGGER.exception("[conf_chart] handler failed")
-            return
 
     def on_class_chart_event(e: Any) -> None:
         try:
-            if not _is_chart_interaction_event(e):
+            if not ce.is_chart_interaction_event(e):
                 return
-            item = current_item()
-            detections = detections_for_view(item)
+            detections = detections_for_view(current_item())
             if not detections:
                 return
             class_counts = Counter(d["class_name"] for d in detections)
             cls_items = sorted(class_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-            idx = _event_index(e, "group_index", "bar_group_index", "index")
-            log_msg(
-                f"[class_chart] event: {_event_short_dump(e)}",
-                throttle_key="event_class",
-                min_interval_sec=0.4,
-            )
-            if isinstance(idx, int) and 0 <= idx < len(cls_items):
+            idx = ce.event_index(e, "group_index", "bar_group_index", "index")
+            log_msg(f"[class_chart] event: {ce.event_short_dump(e)}", throttle_key="event_class", min_interval_sec=0.4)
+            if 0 <= idx < len(cls_items):
                 if not _should_process_hover_index("class", idx):
                     return
                 name, cnt = cls_items[idx]
                 set_chart_hover_info(f"Class chart: {name} | count={cnt}")
         except Exception:
             LOGGER.exception("[class_chart] handler failed")
-            return
-
-    def on_size_conf_chart_event(e: Any) -> None:
-        try:
-            # Click-only mode: no hover processing for scatter to keep UI responsive.
-            if not _is_click_like_event(e):
-                log_msg(
-                    f"[scatter_chart] ignored non-click event: {_event_short_dump(e)}",
-                    throttle_key="event_scatter_ignored",
-                    min_interval_sec=0.5,
-                )
-                return
-            item = current_item()
-            detections = detections_for_view(item)
-            idx = _event_index(e, "spot_index", "index", allow_payload=False)
-            if idx < 0:
-                idx = _event_index(e, "spot_index", "index", allow_payload=True)
-            log_msg(
-                f"[scatter_chart] click event: {_event_short_dump(e)} resolved_idx={idx} detections={len(detections)}",
-                throttle_key="event_scatter_click",
-                min_interval_sec=0.3,
-            )
-            if isinstance(idx, int) and 0 <= idx < len(detections):
-                d = detections[idx]
-                set_chart_hover_info(
-                    f"Area/conf chart: #{d['index']} {d['class_name']} | area={d['area']} | conf={d['confidence']:.3f}"
-                )
-                log_msg(
-                    f"[scatter_chart] selected detection #{d['index']} class={d['class_name']} conf={d['confidence']:.3f} area={d['area']}",
-                    throttle_key="event_scatter_selected",
-                    min_interval_sec=0.25,
-                )
-            else:
-                log_msg(
-                    f"[scatter_chart] click has no valid point index ({idx})",
-                    level="warning",
-                    throttle_key="event_scatter_bad_idx",
-                    min_interval_sec=0.6,
-                )
-        except Exception:
-            LOGGER.exception("[scatter_chart] handler failed")
-            return
 
     def on_scatter_host_size_change(e: ft.ControlEvent) -> None:
         w = float(getattr(e, "width", 0.0) or 0.0)
@@ -907,37 +623,6 @@ def main(page: ft.Page) -> None:
             on_scroll=wheel_zoom_handler(target),
         )
 
-    def open_files_dialog(title: str, filetypes: list[tuple[str, str]]) -> list[Path]:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected = filedialog.askopenfilenames(title=title, filetypes=filetypes)
-        root.destroy()
-        return [Path(p) for p in selected] if selected else []
-
-    def open_file_dialog(title: str, filetypes: list[tuple[str, str]]) -> Path | None:
-        files = open_files_dialog(title, filetypes)
-        return files[0] if files else None
-
-    def save_file_dialog(title: str, default_name: str, extension: str, filetypes: list[tuple[str, str]]) -> Path | None:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected = filedialog.asksaveasfilename(
-            title=title,
-            initialfile=default_name,
-            defaultextension=extension,
-            filetypes=filetypes,
-        )
-        root.destroy()
-        return Path(selected) if selected else None
-
     def current_item() -> dict[str, Any] | None:
         idx = state["active_index"]
         items = state["images"]
@@ -975,15 +660,7 @@ def main(page: ft.Page) -> None:
         apply_zoom("source", value=1.0, refresh=False)
 
         if item["report"]:
-            report = item["report"]
-            detections = detections_for_view(item)
-            result_path = item.get("annotated_path")
-            result_image.src = str(result_path) if result_path else ""
-            result_image.visible = bool(result_path)
-            update_summary(report, detections_for_view=detections)
-            update_table(detections)
-            update_log(detections)
-            update_chart_view(detections)
+            refresh_result_views(item)
         else:
             clear_result_view("Ready to run inference for selected image.")
 
@@ -999,7 +676,7 @@ def main(page: ft.Page) -> None:
         for path in paths:
             try:
                 validate_image_path(path)
-            except Exception:
+            except (OSError, ValueError):
                 continue
             key = str(path).lower()
             if key in existing:
@@ -1026,13 +703,15 @@ def main(page: ft.Page) -> None:
             toast(f"Added {added} image(s).", "success")
         render_active_image()
 
-    def pick_images_click(_: ft.ControlEvent) -> None:
+    async def pick_images_click(_: ft.ControlEvent) -> None:
         try:
-            paths = open_files_dialog(
-                title="Select images",
-                filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")],
+            files = await file_picker.pick_files(
+                dialog_title="Select images",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["png", "jpg", "jpeg"],
+                allow_multiple=True,
             )
-            add_images(paths)
+            add_images([Path(f.path) for f in files or [] if f.path])
         except Exception as ex:
             toast(f"Image pick error: {ex}", "error")
 
@@ -1047,15 +726,11 @@ def main(page: ft.Page) -> None:
             render_active_image()
 
     def on_conf_threshold_change(e: ft.ControlEvent) -> None:
-        state["conf_filter"] = float(e.control.value)
+        state["conf_filter"] = round(float(e.control.value), 2)
         conf_threshold_value.value = f"{state['conf_filter']:.2f}"
         item = current_item()
         if item and item.get("report"):
-            detections = detections_for_view(item)
-            update_summary(item["report"], detections_for_view=detections)
-            update_table(detections)
-            update_log(detections)
-            update_chart_view(detections)
+            refresh_result_views(item)
         page.update()
 
     def set_selected_model(model_path: Path) -> None:
@@ -1063,18 +738,20 @@ def main(page: ft.Page) -> None:
             raise ValueError("Please select a .pt model file.")
         state["model_path"] = model_path
         state["model"] = None
+        update_state(state_path, model_path=str(model_path))
         update_model_widgets()
         toast("Model selected", "success")
         page.update()
 
-    def pick_model_click(_: ft.ControlEvent) -> None:
+    async def pick_model_click(_: ft.ControlEvent) -> None:
         try:
-            path = open_file_dialog(
-                title="Select YOLO model",
-                filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")],
+            files = await file_picker.pick_files(
+                dialog_title="Select YOLO model",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["pt"],
             )
-            if path:
-                set_selected_model(path)
+            if files and files[0].path:
+                set_selected_model(Path(files[0].path))
         except Exception as ex:
             toast(f"Model pick error: {ex}", "error")
 
@@ -1096,39 +773,37 @@ def main(page: ft.Page) -> None:
             infer = run_inference(
                 model=state["model"],
                 image_path=image_path,
-                conf_thres=default_conf,
+                conf_thres=inference_conf,
                 iou_thres=default_iou,
                 device="cpu",
             )
             detections = infer["detections"]
 
-            annotated_path = draw_detections(image_path, detections, out_dir=artifacts_dir / "annotated")
-            image_info = get_image_info(image_path)
-            report = build_report(
-                image_info=image_info,
+            item["detections"] = detections
+            item["report"] = build_report(
+                image_info=get_image_info(image_path),
                 model_path=Path(state["model_path"]),
                 detections=detections,
                 inference_ms=infer["elapsed_ms"],
-                conf_thres=default_conf,
+                conf_thres=inference_conf,
                 iou_thres=default_iou,
                 device=device_label,
             )
-            item["detections"] = detections
-            item["annotated_path"] = annotated_path
-            item["report"] = report
+            visible = detections_for_view(item)
+            item["annotated_path"] = draw_detections(image_path, visible, out_dir=artifacts_dir / "annotated")
 
             render_active_image()
             apply_zoom("result", value=1.0, refresh=False)
-            if detections:
-                set_ui_state("success", f"Detection completed - Found {len(detections)} object(s)")
-                toast(f"Inference done. Objects: {len(detections)}", "success")
+            if visible:
+                set_ui_state("success", f"Detection completed - Found {len(visible)} object(s)")
+                toast(f"Inference done. Objects: {len(visible)}", "success")
             else:
                 set_ui_state("empty", "No objects detected")
                 toast("No objects detected.", "warning")
             elapsed_total = (time.perf_counter() - t0) * 1000.0
             log_msg(
-                f"[inference] done image={item['path'].name} det={len(detections)} "
-                f"model_ms={infer['elapsed_ms']} total_ms={elapsed_total:.1f}"
+                f"[inference] done image={item['path'].name} det={len(visible)} (raw={len(detections)}) "
+                f"model_ms={infer['elapsed_ms']:.1f} total_ms={elapsed_total:.1f}"
             )
         except Exception as ex:
             set_ui_state("error", "Inference error")
@@ -1137,43 +812,38 @@ def main(page: ft.Page) -> None:
         finally:
             page.update()
 
-    def save_json_click(_: ft.ControlEvent) -> None:
+    async def save_report_click(fmt: str) -> None:
         item = current_item()
         if not item or not item["report"]:
             toast("Run inference for active image before saving report.", "warning")
             return
         try:
-            path = save_file_dialog(
-                title="Save JSON report",
-                default_name=f"{item['path'].stem}_report.json",
-                extension=".json",
-                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            selected = await file_picker.save_file(
+                dialog_title=f"Save {fmt.upper()} report",
+                file_name=f"{item['path'].stem}_report.{fmt}",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=[fmt],
             )
-            if not path:
+            if not selected:
                 return
-            save_report_json(item["report"], path)
-            toast(f"JSON saved: {path}", "success")
+            path = Path(selected)
+            if path.suffix.lower() != f".{fmt}":
+                path = path.with_name(f"{path.name}.{fmt}")
+            # Export exactly what is on screen: detections above the slider threshold.
+            report = filter_report(item["report"], float(state["conf_filter"]))
+            if fmt == "json":
+                save_report_json(report, path)
+            else:
+                save_report_csv(report, path)
+            toast(f"{fmt.upper()} saved: {path}", "success")
         except Exception as ex:
             toast(str(ex), "error")
 
-    def save_csv_click(_: ft.ControlEvent) -> None:
-        item = current_item()
-        if not item or not item["report"]:
-            toast("Run inference for active image before saving report.", "warning")
-            return
-        try:
-            path = save_file_dialog(
-                title="Save CSV report",
-                default_name=f"{item['path'].stem}_report.csv",
-                extension=".csv",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            )
-            if not path:
-                return
-            save_report_csv(item["report"], path)
-            toast(f"CSV saved: {path}", "success")
-        except Exception as ex:
-            toast(str(ex), "error")
+    async def save_json_click(_: ft.ControlEvent) -> None:
+        await save_report_click("json")
+
+    async def save_csv_click(_: ft.ControlEvent) -> None:
+        await save_report_click("csv")
 
     def open_results_folder(_: ft.ControlEvent) -> None:
         folder = artifacts_dir.resolve()
@@ -1189,57 +859,53 @@ def main(page: ft.Page) -> None:
         page.theme_mode = ft.ThemeMode.DARK if mode == "dark" else ft.ThemeMode.LIGHT
         page.theme = ft.Theme(color_scheme_seed=color("accent"))
         page.bgcolor = color("bg")
-        save_theme(mode)
+        update_state(state_path, theme=mode)
 
-        header_card.bgcolor = color("card")
-        header_card.border = ft.Border.all(1, color("border"))
-        input_card.bgcolor = color("card")
-        input_card.border = ft.Border.all(1, color("border"))
-        src_card.bgcolor = color("card")
-        src_card.border = ft.Border.all(1, color("border"))
-        det_card.bgcolor = color("card")
-        det_card.border = ft.Border.all(1, color("border"))
-        sum_card.bgcolor = color("card")
-        sum_card.border = ft.Border.all(1, color("border"))
-        charts_card.bgcolor = color("card")
-        charts_card.border = ft.Border.all(1, color("border"))
-        table_card.bgcolor = color("card")
-        table_card.border = ft.Border.all(1, color("border"))
-        log_card.bgcolor = color("card")
-        log_card.border = ft.Border.all(1, color("border"))
+        for card in (header_card, input_card, src_card, det_card, sum_card, charts_card, table_card, log_card):
+            card.bgcolor = color("card")
+            card.border = ft.Border.all(1, color("border"))
 
-        title.color = color("text_primary")
-        subtitle.color = color("text_secondary")
-        model_path_text.color = color("text_secondary")
-        source_zoom_text.color = color("text_secondary")
-        result_zoom_text.color = color("text_secondary")
-        image_counter.color = color("text_secondary")
-        loaded_label.color = color("text_primary")
-        loaded_value.color = color("text_secondary")
-        device_label_text.color = color("text_primary")
-        device_value.color = color("text_secondary")
-        conf_threshold_label.color = color("text_primary")
-        conf_threshold_value.color = color("text_secondary")
-        summary_title.color = color("text_primary")
-        charts_title.color = color("text_primary")
-        chart_hover_info.color = color("text_primary")
-        table_title.color = color("text_primary")
-        log_title.color = color("text_primary")
-        source_title.color = color("text_primary")
-        result_title.color = color("text_primary")
-        input_title.color = color("text_primary")
+        for text in (
+            title,
+            loaded_label,
+            device_label_text,
+            conf_threshold_label,
+            summary_title,
+            charts_title,
+            chart_hover_info,
+            table_title,
+            log_title,
+            source_title,
+            result_title,
+            input_title,
+        ):
+            text.color = color("text_primary")
+        for text in (
+            subtitle,
+            model_path_text,
+            source_zoom_text,
+            result_zoom_text,
+            image_counter,
+            loaded_value,
+            device_value,
+            conf_threshold_value,
+            charts_empty,
+        ):
+            text.color = color("text_secondary")
 
-        source_canvas.bgcolor = color("panel")
-        result_canvas.bgcolor = color("panel")
-        table_area.bgcolor = color("panel")
+        for panel in (
+            source_canvas,
+            result_canvas,
+            table_area,
+            device_row,
+            loaded_row,
+            confidence_chart_host,
+            class_chart_host,
+            size_conf_chart_host,
+            chart_hover_info_box,
+        ):
+            panel.bgcolor = color("panel")
         detail_log.border_color = color("accent")
-        device_row.bgcolor = color("panel")
-        loaded_row.bgcolor = color("panel")
-        confidence_chart_host.bgcolor = color("panel")
-        class_chart_host.bgcolor = color("panel")
-        size_conf_chart_host.bgcolor = color("panel")
-        chart_hover_info_box.bgcolor = color("panel")
-        charts_empty.color = color("text_secondary")
 
         choose_model_btn.style = ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10),
@@ -1268,11 +934,7 @@ def main(page: ft.Page) -> None:
 
         item = current_item()
         if item and item.get("report"):
-            detections = detections_for_view(item)
-            update_summary(item["report"], detections_for_view=detections)
-            update_table(detections)
-            update_log(detections)
-            update_chart_view(detections)
+            refresh_result_views(item)
         else:
             clear_result_view("No image selected." if not item else "Ready to run inference for selected image.")
 
@@ -1353,9 +1015,9 @@ def main(page: ft.Page) -> None:
     conf_threshold_label = ft.Text("Confidence threshold", size=input_text_size, weight=ft.FontWeight.W_700)
     conf_threshold_value = ft.Text(f"{state['conf_filter']:.2f}", size=input_text_size)
     conf_threshold_slider = ft.Slider(
-        min=0.05,
-        max=0.95,
-        divisions=18,
+        min=conf_slider_min,
+        max=conf_slider_max,
+        divisions=round((conf_slider_max - conf_slider_min) / 0.05),
         value=state["conf_filter"],
         on_change=on_conf_threshold_change,
     )
@@ -1513,6 +1175,7 @@ def main(page: ft.Page) -> None:
             left_axis=fch.ChartAxis(label_size=42),
             bottom_axis=fch.ChartAxis(label_size=32),
             interactive=True,
+            on_event=on_conf_chart_event,
         )
         class_chart = fch.BarChart(
             expand=True,
@@ -1521,6 +1184,7 @@ def main(page: ft.Page) -> None:
             left_axis=fch.ChartAxis(label_size=42),
             bottom_axis=fch.ChartAxis(label_size=56),
             interactive=True,
+            on_event=on_class_chart_event,
         )
         size_conf_chart = fch.ScatterChart(
             expand=True,
@@ -1532,8 +1196,6 @@ def main(page: ft.Page) -> None:
             bottom_axis=fch.ChartAxis(label_size=44),
             interactive=False,
         )
-        _attach_chart_handler(confidence_chart, on_conf_chart_event)
-        _attach_chart_handler(class_chart, on_class_chart_event)
         charts_empty = ft.Text(
             "Run inference to build charts: confidence, class counts and bbox-size diagnostics.",
             color=color("text_secondary"),

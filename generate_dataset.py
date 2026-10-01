@@ -33,6 +33,7 @@ from utils.image_ops import (
     colorize_mask_with_duotone,
     colorize_mask_with_gradient,
     crop_to_alpha,
+    get_tight_bbox_from_alpha,
     load_background_paths,
     load_object_assets,
     prepare_background,
@@ -184,12 +185,19 @@ def generate_one_image(
                 rng=rng,
                 np_rng=np_rng,
                 apply_appearance=apply_appearance,
+                allow_flip=asset.class_name not in cfg.no_flip_classes,
             )
             obj_rgba = crop_to_alpha(obj_rgba)
             if obj_rgba is None:
                 continue
 
             if obj_rgba.width < cfg.min_object_size_px or obj_rgba.height < cfg.min_object_size_px:
+                continue
+
+            # The crop keeps the faint anti-aliased fringe for rendering; the label uses
+            # the visible object only (see DatasetConfig.bbox_alpha_threshold).
+            tight = get_tight_bbox_from_alpha(obj_rgba, threshold=cfg.bbox_alpha_threshold)
+            if tight is None:
                 continue
 
             pos = find_position_for_object(
@@ -210,12 +218,13 @@ def generate_one_image(
             canvas_rgba.alpha_composite(obj_rgba, dest=(x, y))
 
             bbox = {
-                "x_min": x,
-                "y_min": y,
-                "x_max": x + obj_rgba.width - 1,
-                "y_max": y + obj_rgba.height - 1,
+                "x_min": x + tight[0],
+                "y_min": y + tight[1],
+                "x_max": x + tight[2],
+                "y_max": y + tight[3],
             }
-            placed_bboxes.append((bbox["x_min"], bbox["y_min"], bbox["x_max"], bbox["y_max"]))
+            # Collision checks use the full pasted area so fringes of neighbours never overlap.
+            placed_bboxes.append((x, y, x + obj_rgba.width - 1, y + obj_rgba.height - 1))
             objects_info.append(
                 {
                     "class": asset.class_name,
@@ -303,10 +312,38 @@ def validate_inputs(objects_dir: Path, backgrounds_dir: Path, cfg: DatasetConfig
         raise FileNotFoundError(f"Objects directory does not exist: {objects_dir}")
     if not backgrounds_dir.exists():
         raise FileNotFoundError(f"Backgrounds directory does not exist: {backgrounds_dir}")
+    if cfg.dataset_size < 1:
+        raise ValueError("--count must be at least 1")
     if not (0.0 < cfg.train_split < 1.0):
         raise ValueError("--train-split must be in (0, 1)")
     if cfg.min_objects_per_image > cfg.max_objects_per_image:
         raise ValueError("min_objects_per_image cannot be greater than max_objects_per_image")
+
+
+# Top-level entries a dataset produced by this script may contain.
+DATASET_ENTRIES = {"train", "val", "data.yaml", "classes.json"}
+
+
+def prepare_output_dir(output_dir: Path, protected_dirs: List[Path]) -> None:
+    """Recreate output_dir, refusing to wipe anything that is not a previous dataset."""
+    out = output_dir.resolve()
+    for protected in protected_dirs:
+        protected = protected.resolve()
+        if out == protected or out in protected.parents:
+            raise ValueError(f"Refusing to use '{output_dir}' as output: it is or contains '{protected}'.")
+
+    if out.exists():
+        if not out.is_dir():
+            raise ValueError(f"Output path exists and is not a directory: {output_dir}")
+        unexpected = sorted(p.name for p in out.iterdir() if p.name not in DATASET_ENTRIES)
+        if unexpected:
+            raise ValueError(
+                f"Output directory '{output_dir}' is not empty and does not look like a dataset "
+                f"produced by this script (unexpected: {', '.join(unexpected[:5])}). "
+                "Choose another --output or remove the directory manually."
+            )
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> None:
@@ -342,9 +379,10 @@ def main() -> None:
             f"Generator will use up to {unique_classes_count} unique objects per image."
         )
 
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(
+        output_dir,
+        protected_dirs=[Path.cwd(), Path(__file__).resolve().parent, objects_dir, backgrounds_dir],
+    )
 
     split_map = choose_split_indices(cfg.dataset_size, cfg.train_split, rng)
     split_dirs = {
@@ -428,7 +466,7 @@ def main() -> None:
             raise SystemExit(130)
 
     save_classes_json(class_map, output_dir)
-    save_data_yaml(class_map, output_dir, dataset_root_name=output_dir.name)
+    save_data_yaml(class_map, output_dir)
 
     print("Done.")
     print(f"Output: {output_dir.resolve()}")

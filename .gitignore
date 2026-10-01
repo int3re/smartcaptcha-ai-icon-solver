@@ -7,20 +7,24 @@ __pycache__/
 output/
 output_*/
 
-# Фоны скачиваются download_backgrounds_uuid.py, слишком велики для git
-backgrounds/
+# Результаты обучения: в репозитории только runs/train (графики, results.csv, best.pt);
+# last.pt нужен лишь для возобновления, прогоны оценки (runs/val) локальные
+runs/*
+!runs/train/
+runs/train/*/weights/last.pt
 
-# Результаты обучения, веса, артефакты GUI
-runs/
-weights/
+# Веса, артефакты GUI
+/weights/
 *.pt
-gui_outputs/
-backups/
+!runs/train/*/weights/best.pt
+/gui_outputs/
+/backups/
 
 # Логи и архивы
 *.log
 *.zip
 
-# Бинарные документы (презентация, образец)
+# Курсовая: текст, презентация, образец
+Курсовая_*.md
 *.pptx
 *.docx

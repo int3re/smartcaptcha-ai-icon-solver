@@ -1,34 +1,60 @@
 from __future__ import annotations
 
+import csv
 import time
 from pathlib import Path
 from typing import Any
 
 from ultralytics import YOLO
 
+# COCO-pretrained starting checkpoints: they do not know the icon classes.
+BASE_CHECKPOINTS = {"yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolo11n.pt", "yolo26n.pt"}
+SCORE_COLUMN = "metrics/mAP50-95(B)"
+
+
+def run_best_score(run_dir: Path) -> float | None:
+    """Best validation mAP50-95 recorded in an Ultralytics run, if results.csv is present."""
+    results_csv = run_dir / "results.csv"
+    try:
+        with results_csv.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return None
+    scores = []
+    for row in rows:
+        row = {k.strip(): v for k, v in row.items() if k}
+        try:
+            scores.append(float(row[SCORE_COLUMN]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return max(scores) if scores else None
+
 
 def find_model_candidates(project_root: Path) -> list[Path]:
+    """Trained models, best first.
+
+    Runs in runs/train are ranked by their best mAP50-95 (runs without results.csv go
+    last, newest first). Scores are only comparable between runs validated on the same
+    val set; the user can always pick another model manually.
+    """
     candidates: list[Path] = []
-    explicit = [
-        project_root / "weights" / "yolov8n_gpu_best.pt",
-        project_root / "weights" / "yolov8n_gpu_last.pt",
-        project_root / "weights" / "yolov8n.pt",
-        project_root / "yolov8n.pt",
-    ]
-    for p in explicit:
-        if p.exists():
-            candidates.append(p)
 
     runs_train = project_root / "runs" / "train"
     if runs_train.exists():
-        run_dirs = sorted([d for d in runs_train.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime, reverse=True)
+        scores = {d: run_best_score(d) for d in runs_train.iterdir() if d.is_dir()}
+        run_dirs = sorted(
+            scores,
+            key=lambda d: (scores[d] is not None, scores[d] or 0.0, d.stat().st_mtime),
+            reverse=True,
+        )
         for run_dir in run_dirs:
-            best = run_dir / "weights" / "best.pt"
-            last = run_dir / "weights" / "last.pt"
-            if best.exists():
-                candidates.append(best)
-            if last.exists():
-                candidates.append(last)
+            candidates.extend(p for p in (run_dir / "weights" / "best.pt", run_dir / "weights" / "last.pt") if p.exists())
+
+    weights_dir = project_root / "weights"
+    if weights_dir.exists():
+        trained = [p for p in weights_dir.glob("*.pt") if p.name not in BASE_CHECKPOINTS]
+        trained.sort(key=lambda p: ("best" not in p.stem, -p.stat().st_mtime))
+        candidates.extend(trained)
 
     # Remove duplicates while preserving priority.
     uniq: list[Path] = []
@@ -41,7 +67,12 @@ def find_model_candidates(project_root: Path) -> list[Path]:
     return uniq
 
 
-def auto_detect_model(project_root: Path) -> Path | None:
+def auto_detect_model(project_root: Path, preferred: Path | str | None = None) -> Path | None:
+    """The model the user picked last time if it still exists, otherwise the best candidate."""
+    if preferred:
+        preferred_path = Path(preferred)
+        if preferred_path.is_file():
+            return preferred_path.resolve()
     candidates = find_model_candidates(project_root)
     return candidates[0] if candidates else None
 
