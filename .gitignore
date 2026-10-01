@@ -1,0 +1,26 @@
+# Окружение и кэш
+.venv/
+__pycache__/
+*.pyc
+
+# Сгенерированные датасеты (воспроизводятся generate_dataset.py по seed)
+output/
+output_*/
+
+# Фоны скачиваются download_backgrounds_uuid.py, слишком велики для git
+backgrounds/
+
+# Результаты обучения, веса, артефакты GUI
+runs/
+weights/
+*.pt
+gui_outputs/
+backups/
+
+# Логи и архивы
+*.log
+*.zip
+
+# Бинарные документы (презентация, образец)
+*.pptx
+*.docx
