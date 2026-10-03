@@ -34,10 +34,12 @@ def render_detections(image_path: Path, detections: list[dict[str, Any]]) -> Ima
         x1, y1, x2, y2 = b["x_min"], b["y_min"], b["x_max"], b["y_max"]
         label = f'{d["class_name"]} {d["confidence"]:.3f}'
         draw.rectangle((x1, y1, x2, y2), outline=(77, 163, 255), width=3)
-        tw = len(label) * 7 + 8
+        tw = int(draw.textlength(label, font=font)) + 8
+        # Keep the label inside the image for boxes near the right/top edge.
+        tx = max(0, min(x1, img.width - tw))
         ty = max(0, y1 - 16)
-        draw.rectangle((x1, ty, x1 + tw, ty + 14), fill=(19, 26, 46))
-        draw.text((x1 + 4, ty + 1), label, font=font, fill=(220, 235, 255))
+        draw.rectangle((tx, ty, tx + tw, ty + 14), fill=(19, 26, 46))
+        draw.text((tx + 4, ty + 1), label, font=font, fill=(220, 235, 255))
     return img
 
 
